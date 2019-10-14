@@ -22,8 +22,6 @@ class G_style(torch.nn.Module):
         self.dlatent_avg_beta = dlatent_avg_beta
         self.register_buffer('dlatent_avg', torch.zeros(dlatent_size))
 
-        self.apply(_init_weight)
-
     def forward(self, latent, label=None, alpha=0.9, beta=0.7, cutoff=None, stage=None, **kwargs):
         """Args:
                alpha: probability of mixing styles during training. None = disable.
@@ -32,7 +30,6 @@ class G_style(torch.nn.Module):
         """
         if self.training or (beta is not None and beta == 1):
             beta = None
-        cutoff = [cutoff, stage][cutoff is None]
         if self.training or (cutoff is not None and cutoff <= 0):
             cutoff = None
         if not self.training or (alpha is not None and  alpha <= 0):
@@ -40,7 +37,7 @@ class G_style(torch.nn.Module):
         if not self.training or self.dlatent_avg_beta == 1:
             self.dlatent_avg_beta = None
         if stage is not None and stage <= 0:
-            stage = None
+            stage = self.synthesis.stage
 
         dlatents = self._dlatents(stage, latent, label, alpha, beta, cutoff, **kwargs)
         noises = self._noises(stage, latent.size(0), latent.device, **kwargs)
@@ -54,27 +51,39 @@ class G_style(torch.nn.Module):
                latent2: use styles mapped from this input latent besides the single one. None = disable.
                section: stages to apply the additional styles. None = disable.
         """
-        stage = [stage, self.synthesis.stage][stage is None]
         assert stage + 1 <= self.synthesis.resolution_log2, "stage exceeding!"
         num_layers = 2 * stage
+        device = latent.device
 
         dlatent = self.mapping(latent, label, **kwargs)
 
         # Update moving average of W.
         if self.dlatent_avg_beta is not None:
             batch_avg = torch.mean(dlatent, dim=0)
-            self.dlatent_avg = batch_avg + (self.dlatent_avg - batch_avg) * self.dlatent_avg_beta
+            self.dlatent_avg = torch.lerp(batch_avg, self.dlatent_avg, self.dlatent_avg_beta)
 
         dlatents = torch.unsqueeze(dlatent, dim=0).repeat_interleave(num_layers, dim=0)
+        layer_idx = torch.arange(num_layers, device=device).reshape(-1, 1, 1)
 
         # Perform style mixing regularization.
         if alpha is not None:
             _latent2 = torch.randn_like(latent)
-            dlatent2 = self.mapping(_latent2, label, **kwargs)
-            layer_idx = torch.arange(num_layers).reshape(-1, 1, 1)
+            _dlatent2 = self.mapping(_latent2, label, **kwargs)
             mix_cutoff = torch.where(torch.rand(1) < alpha, torch.randint(num_layers, (1,)),
-                                     torch.tensor([num_layers - 1]))
-            dlatents = torch.where(layer_idx < mix_cutoff, dlatent, dlatent2)
+                                     torch.tensor([num_layers - 1])).to(device)
+            dlatents = torch.where(layer_idx < mix_cutoff, dlatent, _dlatent2)
+
+        # Multi-styles.
+        if latent2 is not None and section is not None:
+            dlatent2 = self.mapping(latent2, label, **kwargs)
+            dlatents = torch.where(sum([layer_idx == i for i in section]), dlatent2, dlatent)
+
+        # Apply truncation trick.
+        cutoff = [cutoff, stage][cutoff is None]
+        if beta is not None and cutoff is not None:
+            ones = torch.ones_like(layer_idx, dtype=torch.float)
+            coefs = torch.where(layer_idx < cutoff, beta * ones, ones)
+            dlatents = torch.lerp(self.dlatent_avg, dlatents, coefs)
 
         return dlatents.reshape(-1, 2, *dlatents.shape[1:])
 
@@ -84,14 +93,13 @@ class G_style(torch.nn.Module):
            Args:
                noise_section: stages to apply noises if specified. None means apply noises to all stages.
         """
-        stage = [stage, self.synthesis.stage][stage is None]
         assert stage + 1 <= self.synthesis.resolution_log2, "stage exceeding!"
         if noise_section is None: noise_section = range(1, stage + 1)
 
         noises = []
         resolution = 4
         for i in range(1, stage + 1):
-            shape = (2, batch_size, resolution, resolution)
+            shape = (2, batch_size,1, resolution, resolution)
             noise = torch.randn(shape, device=device) if i in noise_section else torch.zeros(shape, device=device)
             noises.append(noise)
             resolution *= 2
@@ -111,7 +119,9 @@ class GMapping(torch.nn.Module):
 
         self.sub_module = self._make_layers(latent_size + label_size, dlatent_size, mapping_layers, mapping_fmaps)
 
-    def forward(self, latent, label=None, normalize_latent=True):
+        self.apply(_init_weight)
+
+    def forward(self, latent, label=None, normalize_latent=True, **_kwargs):
         if label is None:
             label = torch.empty(latent.size(0), 0, device=latent.device)
 
@@ -152,30 +162,28 @@ class GSynthesis(torch.nn.Module):
         self._kwargs = dict(num_channels=num_channels, dlatent_size=dlatent_size, use_styles=use_styles, use_noise=use_noise)
 
         self.stage_0 = _InputG(self._nf(1), ilatent_size, const_input, **self._kwargs)
-        self.detail_layers = torch.nn.ModuleDict()
+        self.upscales = torch.nn.ModuleDict()
 
         for _ in range(1, [stage, self.resolution_log2 - 1][stage is None]):
             self.__grow()
 
-    def forward(self, stage=None, dlatents=None, noises=None, ilatents=None):
+    def forward(self, stage=None, dlatents=None, noises=None, ilatent=None, **_kwargs):
         stage = [stage, self.stage][stage is None]
-        if self.training:
+        if self.training and stage > self.stage:
             for _ in range(self.stage, stage):
                 self.__grow()
+            if next(self.stage_0.parameters()).is_cuda: self.cuda()
         assert stage <= self.stage, "stage excceeding!"
 
-        if dlatents is None:
-            dlatents = [[None, None]] * self.stage
-        else:
-            dlatents = dlatents.reshape(-1, 2, *dlatents.shape[1:])
+        if dlatents is None: dlatents = [[None, None]] * self.stage
         if noises is None: noises = [[None, None]] * self.stage
 
         _rgb = None
-        x, rgb = self.stage_0(dlatents[0], noises[0], ilatents)
+        x, rgb = self.stage_0(dlatents[0], noises[0], ilatent)
 
         for i in range(1, stage):
             _rgb = rgb
-            x, rgb = self.detail_layers[f'stage_{i}'](x, dlatents[i], noises[i])
+            x, rgb = self.upscales[f'stage_{i}'](x, dlatents[i], noises[i])
 
         return _rgb, rgb
 
@@ -183,7 +191,7 @@ class GSynthesis(torch.nn.Module):
         """Supports progressive growing. """
         assert self.stage + 2 <= self.resolution_log2, "stage exceeding upper limit!"
 
-        self.detail_layers.update({
+        self.upscales.update({
             'stage_{}'.format(self.stage):
             UpScaleConv2d(self._nf(self.stage), self._nf(self.stage + 1), **self._kwargs),
         })
@@ -207,13 +215,15 @@ class _InputG(torch.nn.Module):
 
         self.torgb = torch.nn.Conv2d(num_features, num_channels, 1, 1, 0)
 
-    def forward(self, dlatents=[None, None], noises=[None, None], ilatents=None):
+        self.apply(_init_weight)
+
+    def forward(self, dlatents=[None, None], noises=[None, None], ilatent=None):
         if self.const_input:
             assert dlatents[0] is not None, "dlatent needed!"
             x = torch.repeat_interleave(self.layer_0, dlatents[0].size(0), dim=0)
         else:
-            assert ilatents is not None, "ilatent needed!"
-            x = self.layer_0(ilatents).reshape(-1, self.num_features, 4, 4)
+            assert ilatent is not None, "ilatent needed!"
+            x = self.layer_0(ilatent).reshape(-1, self.num_features, 4, 4)
         x = self.epilog_0(x, dlatents[0], noises[0])
         x = self.layer_1(x)
         x = self.epilog_1(x, dlatents[1], noises[1])
@@ -235,6 +245,8 @@ class UpScaleConv2d(torch.nn.Module):
         self.epilog_1 = EpilogueLayer(fmap_out, **kwargs)
 
         self.torgb = torch.nn.Conv2d(fmap_out, num_channels, 1, 1, 0)
+
+        self.apply(_init_weight)
 
     def forward(self, x, dlatents=[None, None], noises=[None, None]):
         x = self.layer_0(x)
