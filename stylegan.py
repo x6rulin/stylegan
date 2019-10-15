@@ -9,6 +9,66 @@ def _init_weight(m):
             torch.nn.init.constant_(m.bias, 0)
 
 
+def _upscale2d(x, factor=2):
+    assert x.ndim == 4 and all(x.shape)
+    assert isinstance(factor, int) and factor >= 1
+
+    if factor == 1: return x
+
+    s = x.shape
+    x = x.reshape(*s[:3], 1, s[3], 1)
+    x = x.expand(*s[:3], factor, s[3], factor)
+    x = x.reshape(*s[:2], -1, s[3] * factor)
+
+    return x
+
+
+def _downscale2d(x, factor=2, f=(1, 2, 1), normalize=True, flip=False):
+    assert x.ndim == 4 and all(x.shape)
+    assert isinstance(factor, int) and factor >= 1
+
+    if factor == 2:
+        padding, rem = divmod(len(f) - factor, 2)
+        padding += rem == 1
+
+        f = torch.FloatTensor(f).to(x.device)
+        if f.ndim == 1: f = f * f.reshape(-1, 1)
+        assert f.ndim == 2
+        if normalize: f /= f.sum()
+        if flip: f = f[::-1, ::-1]
+        f = f.reshape(1, 1, *f.shape)
+        f = f.expand(x.size(1), 1, *f.shape[2:])
+
+        return torch.nn.functional.conv2d(x, f, stride=factor, padding=padding, groups=x.size(1))
+
+    if factor == 1: return x
+
+    return torch.nn.functional.avg_pool2d(x, factor, factor)
+
+
+def pixel_norm(x, eps=1e-8):
+    """Pixelwise feature vector normalization. """
+    return x * torch.rsqrt(torch.mean(x ** 2, dim=1, keepdim=True) + eps)
+
+
+def instance_norm(x, eps=1e-8):
+    """Instance normalization. """
+    assert len(x.shape) == 4, "shape of input should be NCHW!"
+    x -= torch.mean(x, dim=(2, 3), keepdim=True)
+    return x * torch.rsqrt(torch.mean(x ** 2, dim=(2, 3), keepdim=True) + eps)
+
+
+class D_basic(torch.nn.Module):
+    """Discriminator used in the StyleGAN paper. """
+    def __init__(self):
+        super(D_basic, self).__init__()
+
+        pass
+
+    def forward(self, x):
+        pass
+
+
 class G_style(torch.nn.Module):
     """Style-based generator used in the StyleGAN paper.
        Composed of two sub-networks (GMapping and GSynthesis) that are defined below.
@@ -22,9 +82,9 @@ class G_style(torch.nn.Module):
         self.dlatent_avg_beta = dlatent_avg_beta
         self.register_buffer('dlatent_avg', torch.zeros(dlatent_size))
 
-    def forward(self, latent, label=None, alpha=0.9, beta=0.7, cutoff=None, stage=None, **kwargs):
+    def forward(self, latent, alpha, stage=None, label=None, mixing_prob=0.9, beta=0.7, cutoff=8, **kwargs):
         """Args:
-               alpha: probability of mixing styles during training. None = disable.
+               mixing_prob: probability of mixing styles during training. None = disable.
                beta: style strength multiplier for the truncation trick. None = disable.
                cutoff: number of layers for which to apply the truncation trick. None = disable.
         """
@@ -32,19 +92,19 @@ class G_style(torch.nn.Module):
             beta = None
         if self.training or (cutoff is not None and cutoff <= 0):
             cutoff = None
-        if not self.training or (alpha is not None and  alpha <= 0):
-            alpha = None
+        if not self.training or (mixing_prob is not None and  mixing_prob <= 0):
+            mixing_prob = None
         if not self.training or self.dlatent_avg_beta == 1:
             self.dlatent_avg_beta = None
-        if stage is not None and stage <= 0:
+        if stage is None or (stage is not None and stage <= 0):
             stage = self.synthesis.stage
 
-        dlatents = self._dlatents(stage, latent, label, alpha, beta, cutoff, **kwargs)
+        dlatents = self._dlatents(stage, latent, label, mixing_prob, beta, cutoff, **kwargs)
         noises = self._noises(stage, latent.size(0), latent.device, **kwargs)
 
-        return self.synthesis(stage, dlatents, noises, **kwargs)
+        return self.synthesis(alpha, stage, dlatents, noises, **kwargs)
 
-    def _dlatents(self, stage, latent, label, alpha, beta, cutoff, latent2=None, section=None, **kwargs):
+    def _dlatents(self, stage, latent, label, mixing_prob, beta, cutoff, latent2=None, section=None, **kwargs):
         """Provides intermediate latent space as demand from input latent (with label.)
 
            Args:
@@ -66,11 +126,11 @@ class G_style(torch.nn.Module):
         layer_idx = torch.arange(num_layers, device=device).reshape(-1, 1, 1)
 
         # Perform style mixing regularization.
-        if alpha is not None:
+        if mixing_prob is not None:
             _latent2 = torch.randn_like(latent)
             _dlatent2 = self.mapping(_latent2, label, **kwargs)
-            mix_cutoff = torch.where(torch.rand(1) < alpha, torch.randint(num_layers, (1,)),
-                                     torch.tensor([num_layers - 1])).to(device)
+            mix_cutoff = torch.where(torch.rand(1) < mixing_prob, torch.randint(num_layers, (1,)),
+                                     torch.tensor([num_layers])).to(device)
             dlatents = torch.where(layer_idx < mix_cutoff, dlatent, _dlatent2)
 
         # Multi-styles.
@@ -79,7 +139,6 @@ class G_style(torch.nn.Module):
             dlatents = torch.where(sum([layer_idx == i for i in section]), dlatent2, dlatent)
 
         # Apply truncation trick.
-        cutoff = [cutoff, stage][cutoff is None]
         if beta is not None and cutoff is not None:
             ones = torch.ones_like(layer_idx, dtype=torch.float)
             coefs = torch.where(layer_idx < cutoff, beta * ones, ones)
@@ -99,7 +158,7 @@ class G_style(torch.nn.Module):
         noises = []
         resolution = 4
         for i in range(1, stage + 1):
-            shape = (2, batch_size,1, resolution, resolution)
+            shape = (2, batch_size, 1, resolution, resolution)
             noise = torch.randn(shape, device=device) if i in noise_section else torch.zeros(shape, device=device)
             noises.append(noise)
             resolution *= 2
@@ -131,7 +190,7 @@ class GMapping(torch.nn.Module):
 
         _z = torch.cat([latent, label], dim=1)
         if normalize_latent:
-            _z = _z * torch.rsqrt(torch.mean(_z ** 2, dim=1, keepdim=True) + 1e-8)
+            _z = pixel_norm(_z)
 
         _w = self.sub_module(_z)
         return _w
@@ -167,7 +226,7 @@ class GSynthesis(torch.nn.Module):
         for _ in range(1, [stage, self.resolution_log2 - 1][stage is None]):
             self.__grow()
 
-    def forward(self, stage=None, dlatents=None, noises=None, ilatent=None, **_kwargs):
+    def forward(self, alpha=1, stage=None, dlatents=None, noises=None, ilatent=None, **_kwargs):
         stage = [stage, self.stage][stage is None]
         if self.training and stage > self.stage:
             for _ in range(self.stage, stage):
@@ -185,7 +244,7 @@ class GSynthesis(torch.nn.Module):
             _rgb = rgb
             x, rgb = self.upscales[f'stage_{i}'](x, dlatents[i], noises[i])
 
-        return _rgb, rgb
+        return torch.lerp(_upscale2d(_rgb), rgb, alpha)
 
     def __grow(self):
         """Supports progressive growing. """
@@ -304,11 +363,10 @@ class StyleMod(torch.nn.Module):
         super(StyleMod, self).__init__()
 
         self.affine_transform = torch.nn.Linear(dlatent_size, 2 * num_features)
-        self.instance_norm = torch.nn.InstanceNorm2d(num_features)
 
     def forward(self, features, dlatent):
         styles = self.affine_transform(dlatent)
-        contents = self.instance_norm(features)
+        contents = instance_norm(features)
 
         styles = styles.reshape(-1, 2, contents.size(1), 1, 1)
         features = contents * (styles[:, 0] + 1) + styles[:, 1]
