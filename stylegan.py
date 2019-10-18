@@ -58,15 +58,65 @@ def instance_norm(x, eps=1e-8):
     return x * torch.rsqrt(torch.mean(x ** 2, dim=(2, 3), keepdim=True) + eps)
 
 
+def minibatch_stddev_layer(x, group_size=4, num_new_features=1):
+    group_size = min(group_size, x.size(0)) # Minibatch must be divisible by (or smaller than) group_size.
+    s = x.shape                             # [NCHW]  Input shape.
+    y = torch.reshape(x, (group_size, -1, num_new_features, s[1] // num_new_features, *s[2:])) # [GMncHW]
+    y = torch.mean(y, dim=0, keepdim=True) # [1MncHW] Subtract mean over group.
+    y = torch.mean(y ** 2, dim=0)          # [MncHW]  Calc variance over group.
+    y = torch.sqrt(y + 1e-8)               # [MncHW]  Calc stddev over group.
+    y = torch.mean(y, dim=(2, 3, 4), keepdim=True) # [Mn111] Take average over fmaps and pixels.
+    y = torch.mean(y, dim=2)                       # [Mn11]  Split channels into c channel groups.
+    y = y.repeat(group_size, num_new_features, s[2], s[3]) # [NnHW] Replicate over group and pixels.
+
+    return torch.cat([x, y], dim=1)
+
+
 class D_basic(torch.nn.Module):
     """Discriminator used in the StyleGAN paper. """
-    def __init__(self):
+    def __init__(self, num_channels=3, resolution=1024, fmap_base=8192, fmap_decay=1.0, fmap_max=512,
+                 stage=2, label_size=0, mbstd_group_size=4, mbstd_num_features=1, blur_filter=(1, 2, 1)):
         super(D_basic, self).__init__()
 
-        pass
+        resolution_log2 = torch.log2(torch.FloatTensor([resolution])).item()
+        assert resolution == 2 ** resolution_log2 and resolution >= 4
+        self.resolution_log2 = int(resolution_log2)
+        self._nf = lambda stage: min(int(fmap_base / (2 ** (stage * fmap_decay))), fmap_max)
+
+        self.stage = 1
+        self.final = _OutputD(self._nf(1), label_size, mbstd_group_size, mbstd_num_features)
 
     def forward(self, x):
         pass
+
+
+class _OutputD(torch.nn.Module):
+    def __init__(self, fmap_in, label_size=0, mbstd_group_size=4, mbstd_num_features=1):
+        super(_OutputD, self).__init__()
+
+        self.label_size = label_size
+        self.sub_module = torch.nn.Sequential(
+            torch.nn.Conv2d(fmap_in + mbstd_num_features, fmap_in, 3, 1, 1),
+            torch.nn.LeakyReLU(0.2, inplace=True),
+            torch.nn.Conv2d(fmap_in, fmap_in, 4, 1, 0),
+            torch.nn.LeakyReLU(0.2, inplace=True),
+            torch.nn.Conv2d(fmap_in, max(label_size, 1), 1, 1, 0),
+        )
+
+        self.mbstd_group_size = mbstd_group_size
+        if mbstd_group_size > 1:
+            self.mbstd = lambda x: minibatch_stddev_layer(x, mbstd_group_size, mbstd_num_features)
+
+    def forward(self, x, label=None):
+        if self.mbstd_group_size > 1:
+            x = self.mbstd(x)
+        x = self.sub_module(x)
+        x = x.reshape(x.size(0), -1)
+        if self.label_size:
+            assert label is not None and label.size(1) == self.label_size
+            x = torch.sum(x * label, dim=1, keepdim=True)
+
+        return x
 
 
 class G_style(torch.nn.Module):
@@ -82,7 +132,7 @@ class G_style(torch.nn.Module):
         self.dlatent_avg_beta = dlatent_avg_beta
         self.register_buffer('dlatent_avg', torch.zeros(dlatent_size))
 
-    def forward(self, latent, alpha, stage=None, label=None, mixing_prob=0.9, beta=0.7, cutoff=8, **kwargs):
+    def forward(self, latent, alpha=1, stage=None, label=None, mixing_prob=0.9, beta=0.7, cutoff=8, **kwargs):
         """Args:
                mixing_prob: probability of mixing styles during training. None = disable.
                beta: style strength multiplier for the truncation trick. None = disable.
@@ -218,10 +268,13 @@ class GSynthesis(torch.nn.Module):
         self._nf = lambda stage: min(int(fmap_base / (2 ** (stage * fmap_decay))), fmap_max)
 
         self.stage = 1
-        self._kwargs = dict(num_channels=num_channels, dlatent_size=dlatent_size, use_styles=use_styles, use_noise=use_noise)
+        self.num_channels = num_channels
+        self._kwargs = dict(dlatent_size=dlatent_size, use_styles=use_styles, use_noise=use_noise)
 
-        self.stage_0 = _InputG(self._nf(1), ilatent_size, const_input, **self._kwargs)
-        self.upscales = torch.nn.ModuleDict()
+        self.newborn = _InputG(self._nf(1), ilatent_size, const_input, **self._kwargs)
+        self.growing = torch.nn.ModuleDict()
+
+        self.torgb = torch.nn.ModuleDict({'stage_0': torch.nn.Conv2d(self._nf(1), num_channels, 1, 1, 0)})
 
         for _ in range(1, [stage, self.resolution_log2 - 1][stage is None]):
             self.__grow()
@@ -231,18 +284,23 @@ class GSynthesis(torch.nn.Module):
         if self.training and stage > self.stage:
             for _ in range(self.stage, stage):
                 self.__grow()
-            if next(self.stage_0.parameters()).is_cuda: self.cuda()
+            if next(self.newborn.parameters()).is_cuda: self.cuda()
         assert stage <= self.stage, "stage excceeding!"
 
         if dlatents is None: dlatents = [[None, None]] * self.stage
         if noises is None: noises = [[None, None]] * self.stage
 
-        _rgb = None
-        x, rgb = self.stage_0(dlatents[0], noises[0], ilatent)
+        _x = self.newborn(dlatents[0], noises[0], ilatent)
+        if stage == 1: return self.torgb['stage_0'](_x)
 
-        for i in range(1, stage):
-            _rgb = rgb
-            x, rgb = self.upscales[f'stage_{i}'](x, dlatents[i], noises[i])
+        _i = 1
+        while _i < stage - 1:
+            _x = self.growing[f'stage_{_i}'](_x, dlatents[_i], noises[_i])
+            _i += 1
+        _rgb = self.torgb[f'stage_{_i - 1}'](_x)
+
+        _x = self.growing[f'stage_{_i}'](_x, dlatents[_i], noises[_i])
+        rgb = self.torgb[f'stage_{_i}'](_x)
 
         return torch.lerp(_upscale2d(_rgb), rgb, alpha)
 
@@ -250,15 +308,19 @@ class GSynthesis(torch.nn.Module):
         """Supports progressive growing. """
         assert self.stage + 2 <= self.resolution_log2, "stage exceeding upper limit!"
 
-        self.upscales.update({
+        self.growing.update({
             'stage_{}'.format(self.stage):
             UpScaleConv2d(self._nf(self.stage), self._nf(self.stage + 1), **self._kwargs),
+        })
+        self.torgb.update({
+            'stage_{}'.format(self.stage):
+            torch.nn.Conv2d(self._nf(self.stage + 1), self.num_channels, 1, 1, 0),
         })
         self.stage += 1
 
 class _InputG(torch.nn.Module):
 
-    def __init__(self, num_features, ilatent_size=0, const_input=True, num_channels=3, **kwargs):
+    def __init__(self, num_features, ilatent_size=0, const_input=True, **kwargs):
         super(_InputG, self).__init__()
 
         self.const_input = const_input
@@ -271,8 +333,6 @@ class _InputG(torch.nn.Module):
         self.epilog_0 = EpilogueLayer(num_features, **kwargs)
         self.layer_1 = torch.nn.Conv2d(num_features, num_features, 3, 1, 1, bias=False)
         self.epilog_1 = EpilogueLayer(num_features, **kwargs)
-
-        self.torgb = torch.nn.Conv2d(num_features, num_channels, 1, 1, 0)
 
         self.apply(_init_weight)
 
@@ -287,12 +347,12 @@ class _InputG(torch.nn.Module):
         x = self.layer_1(x)
         x = self.epilog_1(x, dlatents[1], noises[1])
 
-        return x, self.torgb(x)
+        return x
 
 
 class UpScaleConv2d(torch.nn.Module):
     """Building blocks for generator. """
-    def __init__(self, fmap_in, fmap_out, num_channels=3, **kwargs):
+    def __init__(self, fmap_in, fmap_out, **kwargs):
         super(UpScaleConv2d, self).__init__()
 
         self.layer_0 = torch.nn.Sequential(
@@ -303,8 +363,6 @@ class UpScaleConv2d(torch.nn.Module):
         self.layer_1 = torch.nn.Conv2d(fmap_out, fmap_out, 3, 1, 1, bias=False)
         self.epilog_1 = EpilogueLayer(fmap_out, **kwargs)
 
-        self.torgb = torch.nn.Conv2d(fmap_out, num_channels, 1, 1, 0)
-
         self.apply(_init_weight)
 
     def forward(self, x, dlatents=[None, None], noises=[None, None]):
@@ -313,7 +371,7 @@ class UpScaleConv2d(torch.nn.Module):
         x = self.layer_1(x)
         x = self.epilog_1(x, dlatents[1], noises[1])
 
-        return x, self.torgb(x)
+        return x
 
 
 class EpilogueLayer(torch.nn.Module):
