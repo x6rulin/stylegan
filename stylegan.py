@@ -59,6 +59,7 @@ def instance_norm(x, eps=1e-8):
 
 
 def minibatch_stddev_layer(x, group_size=4, num_new_features=1):
+    """Minibatch standard devation. """
     group_size = min(group_size, x.size(0)) # Minibatch must be divisible by (or smaller than) group_size.
     s = x.shape                             # [NCHW]  Input shape.
     y = torch.reshape(x, (group_size, -1, num_new_features, s[1] // num_new_features, *s[2:])) # [GMncHW]
@@ -67,7 +68,7 @@ def minibatch_stddev_layer(x, group_size=4, num_new_features=1):
     y = torch.sqrt(y + 1e-8)               # [MncHW]  Calc stddev over group.
     y = torch.mean(y, dim=(2, 3, 4), keepdim=True) # [Mn111] Take average over fmaps and pixels.
     y = torch.mean(y, dim=2)                       # [Mn11]  Split channels into c channel groups.
-    y = y.repeat(group_size, num_new_features, s[2], s[3]) # [NnHW] Replicate over group and pixels.
+    y = y.repeat(group_size, num_new_features, *s[2:]) # [NnHW] Replicate over group and pixels.
 
     return torch.cat([x, y], dim=1)
 
@@ -82,12 +83,49 @@ class D_basic(torch.nn.Module):
         assert resolution == 2 ** resolution_log2 and resolution >= 4
         self.resolution_log2 = int(resolution_log2)
         self._nf = lambda stage: min(int(fmap_base / (2 ** (stage * fmap_decay))), fmap_max)
+        self._downscale = lambda x: _downscale2d(x, f=blur_filter)
 
         self.stage = 1
-        self.final = _OutputD(self._nf(1), label_size, mbstd_group_size, mbstd_num_features)
+        self.num_channels = num_channels
 
-    def forward(self, x):
-        pass
+        self.final = _OutputD(self._nf(1), label_size, mbstd_group_size, mbstd_num_features)
+        self.sieving = torch.nn.ModuleDict()
+
+        self.fromrgb = torch.nn.ModuleDict({
+            'stage_0': torch.nn.Conv2d(num_channels, self._nf(1), 1, 1, 0),
+        })
+
+        for _ in range(1, stage):
+            self.__grow()
+
+    def forward(self, image, alpha=1, stage=None, label=None):
+        stage = [stage, self.stage][stage is None]
+        if self.training and stage > self.stage:
+            for _ in range(self.stage, stage):
+                self.__grow()
+            if next(self.final.parameters()).is_cuda: self.cuda()
+        assert 1 <= stage <= self.stage, "stage exceeding!"
+
+        x = self.fromrgb[f'stage_{stage - 1}'](image)
+        if stage >= 2:
+            _x = self.fromrgb[f'stage_{stage - 2}'](self._downscale(image))
+            x = torch.lerp(_x, self.sieving[f'stage_{stage - 1}'](x), alpha)
+            for i in range(stage - 2, 0, -1):
+                x = self.sieving[f'stage_{i}'](x)
+
+        return self.final(x, label)
+
+    def __grow(self):
+        """Supports progressive grwing. """
+        self.sieving.update({
+            'stage_{}'.format(self.stage):
+            DownScaleConv2d(self._nf(self.stage + 1), self._nf(self.stage)),
+        })
+        self.fromrgb.update({
+            'stage_{}'.format(self.stage):
+            torch.nn.Conv2d(self.num_channels, self._nf(self.stage + 1), 1, 1, 0),
+        })
+        self.stage += 1
 
 
 class _OutputD(torch.nn.Module):
@@ -107,6 +145,8 @@ class _OutputD(torch.nn.Module):
         if mbstd_group_size > 1:
             self.mbstd = lambda x: minibatch_stddev_layer(x, mbstd_group_size, mbstd_num_features)
 
+        self.apply(_init_weight)
+
     def forward(self, x, label=None):
         if self.mbstd_group_size > 1:
             x = self.mbstd(x)
@@ -117,6 +157,24 @@ class _OutputD(torch.nn.Module):
             x = torch.sum(x * label, dim=1, keepdim=True)
 
         return x
+
+
+class DownScaleConv2d(torch.nn.Module):
+    """Building blocks for dicriminator. """
+    def __init__(self, fmap_in, fmap_out):
+        super(DownScaleConv2d, self).__init__()
+
+        self.sub_module = torch.nn.Sequential(
+            torch.nn.Conv2d(fmap_in, fmap_in, 3, 1, 1),
+            torch.nn.LeakyReLU(0.2, inplace=True),
+            torch.nn.Conv2d(fmap_in, fmap_out, 3, 2, 1),
+            torch.nn.LeakyReLU(0.2, inplace=True),
+        )
+
+        self.apply(_init_weight)
+
+    def forward(self, x):
+        return self.sub_module(x)
 
 
 class G_style(torch.nn.Module):
@@ -226,17 +284,17 @@ class GMapping(torch.nn.Module):
         if label_size:
             self.label_embed = torch.nn.Linear(label_size, latent_size, bias=False)
 
-        self.sub_module = self._make_layers(latent_size + label_size, dlatent_size, mapping_layers, mapping_fmaps)
+        self.sub_module = self._make_layers(latent_size * (1 + (label_size > 0)),
+                                            dlatent_size, mapping_layers, mapping_fmaps)
 
         self.apply(_init_weight)
 
     def forward(self, latent, label=None, normalize_latent=True, **_kwargs):
-        if label is None:
-            label = torch.empty(latent.size(0), 0, device=latent.device)
-
-        if self.label_size:
-            assert labels is not None, "labels needed!"
+        if self.label_size > 0:
+            assert label is not None, "labels needed!"
             label = self.label_embed(label)
+        else:
+            label = torch.empty(latent.size(0), 0, device=latent.device)
 
         _z = torch.cat([latent, label], dim=1)
         if normalize_latent:
@@ -285,7 +343,7 @@ class GSynthesis(torch.nn.Module):
             for _ in range(self.stage, stage):
                 self.__grow()
             if next(self.newborn.parameters()).is_cuda: self.cuda()
-        assert stage <= self.stage, "stage excceeding!"
+        assert 1 <= stage <= self.stage, "stage excceeding!"
 
         if dlatents is None: dlatents = [[None, None]] * self.stage
         if noises is None: noises = [[None, None]] * self.stage
