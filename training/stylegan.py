@@ -9,6 +9,24 @@ def _init_weight(m):
             torch.nn.init.constant_(m.bias, 0)
 
 
+def _blur2d(x, f=[1, 2, 1], normalize=True, flip=False, stride=1):
+    assert x.ndim == 4 and all(x.shape)
+    assert isinstance(stride, int) and stride >= 1
+
+    padding, rem = divmod(len(f) - stride, 2)
+    padding += rem == 1
+
+    f = torch.FloatTensor(f).to(x.device)
+    if f.ndim == 1: f = f * f.reshape(-1, 1)
+    assert f.ndim == 2
+    if normalize: f /= f.sum()
+    if flip: f = f[::-1, ::-1]
+    f = f.reshape(1, 1, *f.shape)
+    f = f.expand(x.size(1), 1, *f.shape[2:])
+
+    return torch.nn.functional.conv2d(x, f, stride=stride, padding=padding, groups=x.size(1))
+
+
 def _upscale2d(x, factor=2):
     assert x.ndim == 4 and all(x.shape)
     assert isinstance(factor, int) and factor >= 1
@@ -23,23 +41,17 @@ def _upscale2d(x, factor=2):
     return x
 
 
-def _downscale2d(x, factor=2, f=(1, 2, 1), normalize=True, flip=False):
+def _downscale2d(x, factor=2, gain=1):
     assert x.ndim == 4 and all(x.shape)
     assert isinstance(factor, int) and factor >= 1
 
     if factor == 2:
-        padding, rem = divmod(len(f) - factor, 2)
-        padding += rem == 1
+        f = [gain / factor] * factor
+        return _blur2d(x, f=f, normalize=False, stride=factor)
 
-        f = torch.FloatTensor(f).to(x.device)
-        if f.ndim == 1: f = f * f.reshape(-1, 1)
-        assert f.ndim == 2
-        if normalize: f /= f.sum()
-        if flip: f = f[::-1, ::-1]
-        f = f.reshape(1, 1, *f.shape)
-        f = f.expand(x.size(1), 1, *f.shape[2:])
+    if gain != 1: x *= gain
 
-        return torch.nn.functional.conv2d(x, f, stride=factor, padding=padding, groups=x.size(1))
+    if factor == 1: return x
 
     if factor == 1: return x
 
@@ -76,14 +88,14 @@ def minibatch_stddev_layer(x, group_size=4, num_new_features=1):
 class D_basic(torch.nn.Module):
     """Discriminator used in the StyleGAN paper. """
     def __init__(self, num_channels=3, resolution=1024, fmap_base=8192, fmap_decay=1.0, fmap_max=512,
-                 stage=2, label_size=0, mbstd_group_size=4, mbstd_num_features=1, blur_filter=(1, 2, 1)):
+                 stage=2, label_size=0, mbstd_group_size=4, mbstd_num_features=1, blur_filter=[1, 2, 1]):
         super(D_basic, self).__init__()
 
         resolution_log2 = torch.log2(torch.FloatTensor([resolution])).item()
         assert resolution == 2 ** resolution_log2 and resolution >= 4
         self.resolution_log2 = int(resolution_log2)
         self._nf = lambda stage: min(int(fmap_base / (2 ** (stage * fmap_decay))), fmap_max)
-        self._downscale = lambda x: _downscale2d(x, f=blur_filter)
+        self.blur_filter = blur_filter
 
         self.stage = 1
         self.num_channels = num_channels
@@ -108,7 +120,7 @@ class D_basic(torch.nn.Module):
 
         x = self.fromrgb[f'stage_{stage - 1}'](image)
         if stage >= 2:
-            _x = self.fromrgb[f'stage_{stage - 2}'](self._downscale(image))
+            _x = self.fromrgb[f'stage_{stage - 2}'](_downscale2d(image))
             x = torch.lerp(_x, self.sieving[f'stage_{stage - 1}'](x), alpha)
             for i in range(stage - 2, 0, -1):
                 x = self.sieving[f'stage_{i}'](x)
@@ -117,9 +129,11 @@ class D_basic(torch.nn.Module):
 
     def __grow(self):
         """Supports progressive grwing. """
+        assert self.stage + 2 <= self.resolution_log2, "stage exceeding upper limit!"
+
         self.sieving.update({
             'stage_{}'.format(self.stage):
-            DownScaleConv2d(self._nf(self.stage + 1), self._nf(self.stage)),
+            DownScaleConv2d(self._nf(self.stage + 1), self._nf(self.stage), self.blur_filter),
         })
         self.fromrgb.update({
             'stage_{}'.format(self.stage):
@@ -161,12 +175,16 @@ class _OutputD(torch.nn.Module):
 
 class DownScaleConv2d(torch.nn.Module):
     """Building blocks for dicriminator. """
-    def __init__(self, fmap_in, fmap_out):
+    def __init__(self, fmap_in, fmap_out, blur_filter=[1, 2, 1]):
         super(DownScaleConv2d, self).__init__()
+
+        self.blur = lambda x: _blur2d(x, f=blur_filter) if blur_filter else x
 
         self.sub_module = torch.nn.Sequential(
             torch.nn.Conv2d(fmap_in, fmap_in, 3, 1, 1),
             torch.nn.LeakyReLU(0.2, inplace=True),
+        )
+        self.down_sample = torch.nn.Sequential(
             torch.nn.Conv2d(fmap_in, fmap_out, 3, 2, 1),
             torch.nn.LeakyReLU(0.2, inplace=True),
         )
@@ -174,7 +192,10 @@ class DownScaleConv2d(torch.nn.Module):
         self.apply(_init_weight)
 
     def forward(self, x):
-        return self.sub_module(x)
+        x = self.sub_module(x)
+        x = self.down_sample(self.blur(x))
+
+        return x
 
 
 class G_style(torch.nn.Module):
