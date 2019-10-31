@@ -4,6 +4,7 @@ import argparse
 import shutil
 import torch
 from torch.utils.data import DataLoader
+from .util import EMA
 
 
 class ArgParse:
@@ -47,6 +48,9 @@ class Trainer:
         self.value = NotImplemented
         self.epoch = 0
 
+        if not os.path.exists(self.args.chkpt_dir):
+            os.makedirs(self.args.chkpt_dir, 0o775)
+
     def _appendcell(self, cells):
         """Set trainer cells for checkout. """
         self.__cell.extend(cells)
@@ -63,6 +67,8 @@ class Trainer:
     def _get_state(obj):
         if isinstance(obj, (torch.nn.Module, torch.optim.Optimizer)):
             _state = obj.state_dict()
+        elif isinstance(obj, EMA):
+            _state = obj.state_dict()
         elif isinstance(obj, dict):
             _state = {k: Trainer._get_state(obj[k]) for k in obj.keys()}
         else:
@@ -78,6 +84,8 @@ class Trainer:
             if isinstance(_dict[k], torch.nn.Module):
                 _dict[k].load_state_dict(v, strict)
             elif isinstance(_dict[k], torch.optim.Optimizer):
+                _dict[k].load_state_dict(v)
+            elif isinstance(_dict[k], EMA):
                 _dict[k].load_state_dict(v)
             elif isinstance(_dict[k], dict):
                 Trainer._load_state(_dict[k], v, strict)
@@ -121,8 +129,6 @@ class Trainer:
 
     def checkpoint(self, value):
         """Save checkpoint for the training process. """
-        if not os.path.exists(self.args.chkpt_dir):
-            os.makedirs(self.args.chkpt_dir, 0o775)
         save_pth = os.path.join(self.args.chkpt_dir, "current.pth.tar")
 
         torch.save(self.state_dict(), save_pth)
