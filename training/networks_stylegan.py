@@ -24,7 +24,7 @@ class D_basic(torch.nn.Module):
         act, gain = _ACTIVATE[nonlinearity]
 
         self.trunk = torch.nn.ModuleList([
-            _EpilogLayer(nf(1), nf(0), act, label_size, mbstd_group_size,
+            _EpilogBlock(nf(1), nf(0), act, label_size, mbstd_group_size,
                          mbstd_num_features, gain, use_wscale)
         ])
         self.branches = torch.nn.ModuleList([
@@ -89,11 +89,11 @@ class D_basic(torch.nn.Module):
         return scores_out
 
 
-class _EpilogLayer(torch.nn.Module):
+class _EpilogBlock(torch.nn.Module):
 
     def __init__(self, fmap_in, fmap_out, activate, label_size=0, mbstd_group_size=4,
                  mbstd_num_features=1, gain=1., use_wscale=False):
-        super(_EpilogLayer, self).__init__()
+        super(_EpilogBlock, self).__init__()
 
         self.mbstd = lambda x: minibatch_stddev_layer(x, mbstd_group_size, mbstd_num_features) \
             if mbstd_group_size > 1 else x
