@@ -209,7 +209,7 @@ class GMapping(torch.nn.Module):
             self.register_parameter("embed",
                                     torch.nn.Parameter(torch.randn(label_size, latent_size)))
 
-        latent_size *= 1 + (label_size > 0)
+        latent_size <<= label_size > 0
         _fmaps = [latent_size] + [mapping_fmaps] * (mapping_layers - 1) + [dlatent_size]
         layers = []
         for _in, _out in zip(_fmaps[:-1], _fmaps[1:]):
