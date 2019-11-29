@@ -69,8 +69,7 @@ class UpscaleConv2d(torch.nn.Module):
         super(UpscaleConv2d, self).__init__()
 
         stride = [1, 2][fused_scale]
-        padding, rem = divmod(kernel_size - stride, 2)
-        padding += rem == 1
+        padding = int((kernel_size - stride) / 2 + 0.5)
 
         if not fused_scale:
             self.sub_module = Conv2d(in_channels, out_channels, kernel_size,
@@ -99,8 +98,7 @@ class ConvDownscale2d(torch.nn.Module):
         super(ConvDownscale2d, self).__init__()
 
         stride = [1, 2][fused_scale]
-        padding, rem = divmod(kernel_size - stride, 2)
-        padding += rem == 1
+        padding = int((kernel_size - stride) / 2 + 0.5)
 
         self.sub_module = Conv2d(in_channels, out_channels, kernel_size,
                                  stride, padding, **kwargs)
