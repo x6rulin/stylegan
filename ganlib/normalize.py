@@ -16,9 +16,10 @@ def instance_norm(x, eps=1e-8):
 
 def minibatch_stddev_layer(x, group_size=4, num_new_features=1):
     """Minibatch standard devation. """
-    group_size = min(group_size, x.size(0)) # Minibatch must be divisible by (or smaller than) group_size.
+    # Minibatch must be divisible by (or smaller than) group_size.
+    group_size = x.size(0) if x.size(0) % group_size else group_size
     s = x.shape                             # [NCHW]  Input shape.
-    y = torch.reshape(x, (group_size, -1, num_new_features, s[1] // num_new_features, *s[2:])) # [GMncHW]
+    y = x.reshape(group_size, -1, num_new_features, s[1] // num_new_features, *s[2:]) # [GMncHW]
     y -= torch.mean(y, dim=0, keepdim=True) # [GMncHW] Subtract mean over group.
     y = torch.mean(y ** 2, dim=0)           # [MncHW]  Calc variance over group.
     y = torch.sqrt(y + 1e-8)                # [MncHW]  Calc stddev over group.
